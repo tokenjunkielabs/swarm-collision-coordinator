@@ -1,10 +1,12 @@
 import { DurableObject } from 'cloudflare:workers';
 export const NOTE = 'If this tool is misbehaving or broken, feel free to fix it on the spot.';
-const VERSION = '2026-10-12.4';
+const VERSION = '2026-10-12.6';
 const facets = {identity:['auth','authentication','authorization','login','log in','signin','sign in','signup','sign up','oauth','session','credential','password','sso','jwt','permission'],payments:['payment','billing','checkout','invoice','stripe','charge'],interface:['ui','frontend','screen','layout','design','accessibility'],storage:['database','schema','sql','storage','persistence','migration'],performance:['performance','latency','speed','optimization','cache','caching'],documentation:['docs','documentation','document','readme','guide'],outreach:['email','reply','contact','outreach','send','proposal']};
 const canon = x => String(x || '').trim().toLowerCase().replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').replace(/\.git$/, '');
 const json = (value,status=200) => Response.json({...value,note:NOTE,version:VERSION},{status});
 const sha = async value => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(value))))).map(b=>b.toString(16).padStart(2,'0')).join('');
+const canonicalJSON=value=>JSON.stringify(value,(_,v)=>v && typeof v==='object' && !Array.isArray(v)?Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v);
+const canonicalSha=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(canonicalJSON(value))))).map(b=>b.toString(16).padStart(2,'0')).join('');
 function work(r) {
   const entity=canon(r.entity); if(!entity) throw Error('canonical entity required');
   const text=String(r.description || '').toLowerCase().replace(/[_-]/g,' '), found=new Set(r.facets || []);
@@ -98,16 +100,20 @@ export class Coordination extends DurableObject {
     try{
       const path=new URL(request.url).pathname;
       if(path==='/health') return json({ok:true,storage:'cloud-sql-durable-object',pc_required:false});
-      if(path==='/snapshot') return json({leases:this.rows('SELECT * FROM leases'),outbound:this.rows('SELECT * FROM sends'),sources:this.rows('SELECT * FROM sources')});
+      if(path==='/snapshot') return json({now:Date.now(),leases:this.rows('SELECT * FROM leases').map(l=>({...l,scope:JSON.parse(l.scope),effective_state:l.state==='ACTIVE' && l.until<=Date.now()?'STALE':l.state})),outbound:this.rows('SELECT * FROM sends').map(s=>({...s,binding:JSON.parse(s.binding),receipt:s.receipt?JSON.parse(s.receipt):null})),sources:this.rows('SELECT * FROM sources')});
       const r=await request.json();let result;
       if(path==='/take') result=this.take(r);
       else if(path==='/progress') result=this.progress(r);
       else if(path==='/reserve') result=await this.reserve(r);
       else if(path==='/transition') result=this.transition(r);
-      else if(path==='/collect') {result=await this.collect();await this.reconcile();}
+      else if(path==='/confirm-preflight-no-effect') result=await this.confirmPreflightNoEffect(r);
+      else if(path==='/collect') {result=await this.collect();await this.reconcile();
+        if(!await this.ctx.storage.getAlarm())await this.ctx.storage.setAlarm(Date.now()+60000);
+        this.save('collector:clock',{...this.state('collector:clock'),last_manual_tick:Date.now(),next_tick:await this.ctx.storage.getAlarm(),phase:'scheduled'});}
       else if(path==='/observe'){
         if(!r.id || !r.source) throw Error('observation ID/source required');
         this.sql.exec('INSERT INTO observations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',r.id,r.source,JSON.stringify(r));result={decision:'OBSERVED'};
+        if(r.claim)result={...result,claim:this.take({...r.claim,operation_id:r.id,owner:r.claim.owner || r.owner})};
       } else if(path==='/alias'){
         const aliases=this.state('aliases'),entity=canon(r.entity);if(!entity || !Array.isArray(r.aliases))throw Error('canonical entity and aliases required');
         for(const name of r.aliases)aliases[canon(name)]=entity;this.save('aliases',aliases);
@@ -118,6 +124,27 @@ export class Coordination extends DurableObject {
     }catch(e){return json({error:e.message,decision:'REPAIR_REQUEST',alternatives:['choose another independent contribution','continue read-only source research']},400);}
   }
   state(id){return JSON.parse(this.rows('SELECT data FROM sources WHERE id=?',id)[0]?.data || '{}');}
+  async confirmPreflightNoEffect(r){
+    const row=this.rows('SELECT * FROM sends WHERE id=?',r.operation_id)[0],input=r.publisher_envelope;
+    if(!row || !['DISPATCHED','UNKNOWN_EFFECT'].includes(row.state) || !this.env.PUBLICATION_JOURNAL || !input || input.operation_id!==row.id || input.operation!=='issue.comment.create')return {decision:'DO_NOT_SEND',message:'No authoritative pre-provider rejection receipt.'};
+    const b=JSON.parse(row.binding),actorId={tokenjunkielabs:311286379,woahwhattheheck:293286387}[b.actor],a=input.args;
+    if(!actorId || !a || b.provider!=='github' || b.conversation_id!==String(a.owner+'/'+a.repo).toLowerCase()+':issue:'+a.issue_number || await sha(a.body)!==b.payload_hash)return {decision:'DO_NOT_SEND'};
+    // Read the existing authoritative publisher row only. Never replay its
+    // publication endpoint, reset consumed claims, or mutate its journal.
+    const original=await this.env.PUBLICATION_JOURNAL.prepare('SELECT digest,state,result FROM ops WHERE op_id=?').bind(row.id).first();
+    const expected=await canonicalSha({version:'tjlabs-publication-2026-09-19.1',path:'/v1/publish',input,actor_id:actorId});
+    if(!original || original.digest!==expected || original.state!=='REWRITE_REQUIRED')return {decision:'DO_NOT_SEND'};
+    const proof=JSON.parse(original.result || '{}');
+    if(proof.allow!==false || proof.incident!==false || proof.operation_id!==row.id || proof.error!=='ATTRIBUTION_REWRITE_REQUIRED')return {decision:'DO_NOT_SEND'};
+    return this.ctx.storage.transactionSync(()=>{
+      const current=this.rows('SELECT * FROM sends WHERE id=?',row.id)[0];
+      if(!current || current.state!==row.state)return {decision:'DO_NOT_SEND'};
+      const evidence={provider:'central-publisher',state:original.state,error:proof.error,operation_id:row.id,digest:original.digest,no_provider_effect:true};
+      this.sql.exec("UPDATE sends SET state='NO_EFFECT_CONFIRMED',fence=?,receipt=?,updated=? WHERE id=?",row.fence+':no-effect:'+row.id,JSON.stringify(evidence),Date.now(),row.id);
+      this.sql.exec('DELETE FROM send_fences WHERE operation_id=?',row.id);this.event('NO_EFFECT_CONFIRMED',row.id,evidence);
+      return {decision:'NO_EFFECT_CONFIRMED',message:'Repair the draft under a new stable operation ID and continue the authorized action.'};
+    });
+  }
   save(id,value){this.sql.exec('INSERT INTO sources VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',id,JSON.stringify(value));}
   async slack(method,args,id){
     const state=this.state(id);if(state.retry_at>Date.now()) return null;
@@ -131,7 +158,12 @@ export class Coordination extends DurableObject {
     const text=m.text || '',id='slack:'+channel+':'+m.ts,candidate=/\b(taking|claimed|working on|claim|take)\b/i.test(text);
     this.sql.exec('INSERT INTO observations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',id,'slack:'+channel,JSON.stringify({ts:m.ts,user:m.user,thread_ts:m.thread_ts,claim_candidate:candidate,text}));
     const marker=text.match(/<collision_claim>([\s\S]*?)<\/collision_claim>/);
-    if(marker){try{this.take({...JSON.parse(marker[1]),operation_id:id,owner:m.user || 'unknown'});}catch{}return;}
+    if(marker){try{
+      const claim=JSON.parse(marker[1]),operation_id=claim.operation_id || id,owner=claim.owner || m.user || 'unknown';
+      const timestamp=Number(m.edited?.ts || m.ts)*1000,ttl=Math.max(30,Math.min(1800,Number(claim.ttl_seconds || 300)))*1000;
+      if(['DONE','RELEASED'].includes(String(claim.state || '').toUpperCase()))this.progress({operation_id,owner,state:String(claim.state).toUpperCase(),progress:'Explicit source lifecycle '+id});
+      else if(Number.isFinite(timestamp) && Date.now()<timestamp+ttl)this.take({...claim,operation_id,owner,ttl_seconds:Math.max(30,(timestamp+ttl-Date.now())/1000)});
+    }catch{}return;}
     if(candidate && Date.now()-Number(m.ts)*1000<1800000){
       for(const match of text.matchAll(/https?:\/\/github\.com\/([\w.-]+\/[\w.-]+)(?:\/(issues|pull)\/(\d+))?/g)){
         try{this.take({operation_id:id+':'+match[1],owner:m.user || 'unknown',entity:'github.com/'+match[1],description:text,resources:match[2]?[match[2]+'/'+match[3]]:[],ttl_seconds:Math.max(30,(Number(m.ts)*1000+1800000-Date.now())/1000)});}catch{}
@@ -202,7 +234,10 @@ export class Coordination extends DurableObject {
     finally{this.connecting=false;}
   }
   async alarm(){
-    await this.collect();await this.reconcile();await this.ctx.storage.setAlarm(Date.now()+60000);
+    try{const result=await this.collect();await this.reconcile();const state=this.state('collector:clock');
+      this.save('collector:clock',{...state,last_alarm_tick:Date.now(),alarm_ticks:(state.alarm_ticks || 0)+1,phase:'collected',requests:result.requests});
+    }catch{this.save('collector:clock',{...this.state('collector:clock'),last_alarm_tick:Date.now(),phase:'read_unavailable'});}
+    finally{await this.ctx.storage.setAlarm(Date.now()+60000);this.save('collector:clock',{...this.state('collector:clock'),next_tick:await this.ctx.storage.getAlarm()});}
   }
   async reconcile(){
     // Read-only reconciliation of exact handles only, never blind resend.

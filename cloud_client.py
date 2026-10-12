@@ -15,7 +15,7 @@ class CloudCoordinator:
     def progress(self,r):return self.request('/progress',r)
     def reserve(self,r):return self.request('/reserve',r)
     def snapshot(self):return self.request('/snapshot')
-    def dispatch(self,r,send,readback):
+    def dispatch(self,r,send,readback,no_effect_checker=None):
         result=self.reserve(r)
         if result['decision']!='RESERVED':return result
         binding={k:r[k] for k in ('operation_id','provider','conversation_id','action','payload_hash','source_version','actor')}
@@ -29,10 +29,16 @@ class CloudCoordinator:
             self.request('/transition',{**binding,'before':'DISPATCHED','after':'SENT','receipt':receipt})
             return {'decision':'SENT','receipt':receipt}
         except BaseException:
+            if no_effect_checker is not None and isinstance(effect,dict):
+                try:
+                    result=no_effect_checker(effect,r)
+                    if result and result.get('decision')=='NO_EFFECT_CONFIRMED':return result
+                except Exception:pass
             partial=None
             if isinstance(effect,dict):
-                handle=effect.get('ts') or effect.get('publication',{}).get('receipt',{}).get('id')
-                if handle:partial={'provider_id':str(handle),'verified':False}
+                handle=effect.get('ts') or effect.get('id') or effect.get('publication',{}).get('receipt',{}).get('id')
+                if handle:partial={'provider_id':str(handle),'thread_id':effect.get('thread_id',effect.get('threadId')),
+                                  'label_ids':effect.get('label_ids',effect.get('labelIds')),'actor':r['actor'],'verified':False}
             try:self.request('/transition',{**binding,'before':'DISPATCHED','after':'UNKNOWN_EFFECT','receipt':partial})
             except Exception:pass # DISPATCHED cloud fence survives local transport loss.
             raise

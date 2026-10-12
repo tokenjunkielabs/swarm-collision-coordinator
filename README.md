@@ -108,3 +108,7 @@ are internal checks, not a competition/submission verification product.
 
 coordinator.py, server.py and collector.py provide a standard-library development
 harness. Their local SQLite state is not authoritative deployment.
+
+A retained one-time historical bootstrap discovers older thread roots without repeated full-history rescans. The independent read-only SocketMode receiver can ingest subscribed live events, including replies to old threads and new channels, and only ACKs transport envelopes. The existing Slack app currently reports too_many_websockets; the receiver backs off without killing other clients. Polling and historical bootstrap continue. No event-coverage claim is made until a subscribed event is observed.
+
+The private cloud MCP endpoint is /mcp and advertises coordination take, progress and snapshot tools. No model call runs on registration.

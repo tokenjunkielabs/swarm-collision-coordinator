@@ -46,9 +46,18 @@ class SlackCollector:
         if marker:
             try:
                 claim = json.loads(marker.group(1))
-                claim['operation_id'] = oid
-                claim['owner'] = message.get('user', 'unknown')
-                self.coordinator.take(claim)
+                claim['operation_id'] = claim.get('operation_id',oid)
+                claim['owner'] = claim.get('owner',message.get('user','unknown'))
+                state=str(claim.get('state','')).upper()
+                if state in ('DONE','RELEASED'):
+                    self.coordinator.progress({**claim,'state':state})
+                else:
+                    declared=max(30,min(1800,int(claim.get('ttl_seconds',300))))
+                    timestamp=float(message.get('edited',{}).get('ts',message['ts']))
+                    remaining=timestamp+declared-time.time()
+                    if remaining>0:
+                        claim['ttl_seconds']=max(30,int(remaining))
+                        self.coordinator.take(claim)
             except (ValueError, KeyError, TypeError):
                 pass
         elif data['claim_candidate']:

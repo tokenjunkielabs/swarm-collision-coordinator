@@ -12,10 +12,18 @@ tag = "v1"
 new_sqlite_classes = ["Coordination"]
 
 [triggers]
-crons = ["* * * * *"]
+crons = []
+# The same Coordination object's persisted alarm is the collector clock.
 
 [observability]
 enabled = false
+
+[[d1_databases]]
+binding = "PUBLICATION_JOURNAL"
+database_name = "tjlabs-github-publisher"
+database_id = "cd16e34e-d0a4-4a6a-8554-571bce59b9d9"
+# Source uses only SELECT of the exact publisher operation row. It never
+# resets consumed mail claims, modifies central ops, or changes its Worker.
 
 # Existing shared custody -> Worker secret bindings:
 # SLACK_TOKEN, SLACK_APP_TOKEN, GITHUB_TOKEN.

@@ -12,6 +12,14 @@ from cloud_client import CloudCoordinator
 from coordinator import digest
 
 NOTE='If this tool is misbehaving or broken, feel free to fix it on the spot.'
+_OWNER_REVIEW_OP_HASHES={
+    'ae646d823871f31c6089671187ff9e31eb35cab27d309d946e667bbe88a44c0e',
+    'f394ac323133c106ba9bf9e20e0b341561afaa8bee8f954d20104ad2540b4ac8',
+    '2320cb840d27a3159fe488b8bc28a51a96d4bc600b26658f95ac1b953f6f14a8',
+    'f550b5b6bbd9f37e88b5fd9b12989bd9165831120a977f5806d31b2266f0d711',
+    '9bd4ca58428fa2a2d65f9fd38846182262f6c1349f8613e183e57bf9e6914286',
+}
+_LAB_ROUTE_HASH='3e586c5f3976df8395bfb616d0c653917d5701ea2acb8ca98c4a2402e3a55fea'
 
 def address(value):
     parsed=parseaddr(str(value))[1].strip().lower()
@@ -25,7 +33,7 @@ def binding(resolved):
     Original RFC Message-ID is account-independent. Caller resolves it from
     provider metadata; a model-supplied summary never supplies this identity.
     """
-    for key in ('operation_id','attempt_id','account','sender','to','subject','mime_tree_digest','content_digest'):
+    for key in ('operation_id','attempt_id','account','sender','to','subject','mime_tree_digest','content_digest','link_id'):
         if key not in resolved or resolved[key] in (None,'',[]):raise ValueError('mail binding missing '+key)
     kind=resolved.get('kind','send')
     for key in ('to','cc','bcc'):
@@ -44,6 +52,17 @@ def binding(resolved):
     if kind in ('reply','forward','sent_followup') and not original:
         raise ValueError('read original RFC Message-ID through provider before immediate mail dispatch')
     event=original if original else 'initial-contact'
+    owner_review=False
+    if kind=='owner_review':
+        op_hash=hashlib.sha256(str(resolved['operation_id']).encode()).hexdigest()
+        route_hash=hashlib.sha256((str(resolved['link_id'])+'|'+str(resolved.get('profile_id',''))).encode()).hexdigest()
+        owner_review=(op_hash in _OWNER_REVIEW_OP_HASHES and route_hash==_LAB_ROUTE_HASH
+            and address(resolved['account'])==address(resolved['sender'])=='tokenjunkielabs@gmail.com'
+            and list(map(address,resolved['to']))==['tokenjunkielabs@gmail.com']
+            and not resolved.get('cc') and not resolved.get('bcc') and not original
+            and bool(re.fullmatch(r'[a-f0-9]{64}',str(resolved.get('central_claim_id','')))))
+        if not owner_review:raise ValueError('owner review requires an exact source-authorized central consumed claim and selected lab account')
+        event='owner-review:'+resolved['operation_id']
     conversation=digest(['mail-recipient-conversation',recipients])
     content={'account':resolved['account'],'sender':address(resolved['sender']),'to':sorted(map(address,resolved['to'])),
              'cc':sorted(map(address,resolved.get('cc',[]))),'bcc':sorted(map(address,resolved.get('bcc',[]))),
@@ -51,9 +70,10 @@ def binding(resolved):
              'mime_tree_digest':resolved['mime_tree_digest'],'attachments':attachments,
              'original_thread_id':resolved.get('original_thread_id'),'original_message_id':resolved.get('original_message_id'),
              'original_rfc_message_id':original,'attempt_id':resolved['attempt_id'],'central_claim_id':resolved.get('central_claim_id')}
+    content['selected_account']={'link_id':resolved['link_id'],'profile_id':resolved.get('profile_id'),'account':address(resolved['account'])}
     return {'operation_id':resolved['operation_id'],'provider':'gmail','conversation_id':conversation,
             'conversation_ids':[digest(['mail-recipient',recipient]) for recipient in recipients],
-            'action':('initial-contact' if not original else 'respond-to:'+str(event)),
+            'action':event if owner_review else ('initial-contact' if not original else 'respond-to:'+str(event)),
             'payload_hash':digest(content),'source_version':str(resolved.get('source_version') or digest([original,resolved.get('original_thread_id')])),
             'actor':address(resolved['account'])}
 
@@ -81,5 +101,6 @@ class MailFence:
     def outcome(self,b,receipt=None,uncertain=False):
         # Owning post-tool/provider readback verifies actual account, original
         # thread, SENT label, exact raw content + attachment hashes first.
-        verified=bool(receipt and receipt.get('verified') is True and receipt.get('provider_id') and receipt.get('actor')==b['actor'])
+        verified=bool(receipt and receipt.get('verified') is True and receipt.get('provider_id') and receipt.get('actor')==b['actor']
+                      and all(receipt.get(key) is True for key in ('selected_account_verified','sent_label_verified','raw_mime_verified','attachments_verified')))
         return self.cloud.request('/transition',{**b,'before':'DISPATCHED','after':'SENT' if verified and not uncertain else 'UNKNOWN_EFFECT','receipt':receipt})
