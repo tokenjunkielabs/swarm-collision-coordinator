@@ -18,9 +18,10 @@ class CloudCoordinator:
     def dispatch(self,r,send,readback):
         result=self.reserve(r)
         if result['decision']!='RESERVED':return result
-        binding={k:r[k] for k in ('operation_id','payload_hash','source_version','actor')}
+        binding={k:r[k] for k in ('operation_id','provider','conversation_id','action','payload_hash','source_version','actor')}
         winner=self.request('/transition',{**binding,'before':'RESERVED','after':'DISPATCHED'})
         if winner.get('dispatch_winner') is not True:return winner
+        effect=None
         try:
             effect=send(r);receipt=readback(effect,r)
             if not receipt or receipt.get('verified') is not True or receipt.get('actor')!=r['actor'] or not receipt.get('provider_id'):
@@ -28,6 +29,10 @@ class CloudCoordinator:
             self.request('/transition',{**binding,'before':'DISPATCHED','after':'SENT','receipt':receipt})
             return {'decision':'SENT','receipt':receipt}
         except BaseException:
-            try:self.request('/transition',{**binding,'before':'DISPATCHED','after':'UNKNOWN_EFFECT'})
+            partial=None
+            if isinstance(effect,dict):
+                handle=effect.get('ts') or effect.get('publication',{}).get('receipt',{}).get('id')
+                if handle:partial={'provider_id':str(handle),'verified':False}
+            try:self.request('/transition',{**binding,'before':'DISPATCHED','after':'UNKNOWN_EFFECT','receipt':partial})
             except Exception:pass # DISPATCHED cloud fence survives local transport loss.
             raise

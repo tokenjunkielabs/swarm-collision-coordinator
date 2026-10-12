@@ -28,7 +28,7 @@ def canonical(value):
     return value
 
 def digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),ensure_ascii=False).encode()).hexdigest()
 
 def scope(value):
     entity = canonical(value.get('entity', ''))
@@ -50,6 +50,8 @@ def overlap(a, b):
         return None
     ar, br = a['resources'], b['resources']
     paths = any(x == y or x.startswith(y + '/') or y.startswith(x + '/') for x in ar for y in br)
+    if a['kind'] != b['kind'] and not paths:
+        return None
     common = set(a['facets']) & set(b['facets'])
     if paths or common:
         return {'reason': 'shared resource' if paths else 'shared contribution facet', 'facets': sorted(common)}
@@ -108,9 +110,10 @@ class Coordinator:
                 match = overlap(item, json.loads(row['scope']))
                 if match:
                     conflicts.append({'operation_id': row['id'], 'owner': row['owner'], 'until': row['until'], **match})
-            if conflicts:
+            definite=[c for c in conflicts if not c.get('ambiguous')]
+            if definite:
                 used = {f for c in conflicts for f in c.get('facets', [])}
-                return {'decision': 'CHOOSE_DIFFERENT_ANGLE', 'conflicts': conflicts,
+                return {'decision': 'CHOOSE_DIFFERENT_ANGLE', 'conflicts': definite,
                         'message': 'Please choose a different angle of contribution or engineering for this claim, or choose another.',
                         'alternatives': [f for f in FACETS if f not in used and f != 'outreach'],
                         'send_authorized': False}
@@ -118,7 +121,8 @@ class Coordinator:
                        'ON CONFLICT(id) DO UPDATE SET until=excluded.until,state=excluded.state,version=leases.version+1',
                        (oid, owner, json.dumps(item), self.clock() + ttl, 'ACTIVE'))
             self.event(db, 'take', oid, item)
-            return {'decision': 'TAKEN', 'operation_id': oid, 'until': self.clock() + ttl, 'send_authorized': False}
+            return {'decision': 'TAKEN_WITH_SCOPE_ADVICE' if conflicts else 'TAKEN', 'scope_advice': conflicts,
+                    'operation_id': oid, 'until': self.clock() + ttl, 'send_authorized': False}
 
     def progress(self, request):
         with self.transaction() as db:

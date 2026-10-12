@@ -1,19 +1,21 @@
 import { DurableObject } from 'cloudflare:workers';
 export const NOTE = 'If this tool is misbehaving or broken, feel free to fix it on the spot.';
-const VERSION = '2026-10-12.1';
-const facets = {identity:['auth','authentication','login','signin','oauth','session'],payments:['payment','billing','checkout','invoice','stripe'],interface:['ui','frontend','screen','layout','design'],storage:['database','schema','sql','storage','persistence'],performance:['performance','latency','speed','optimization','cache'],documentation:['docs','documentation','readme','guide'],outreach:['email','reply','contact','outreach','send','proposal']};
+const VERSION = '2026-10-12.4';
+const facets = {identity:['auth','authentication','authorization','login','log in','signin','sign in','signup','sign up','oauth','session','credential','password','sso','jwt','permission'],payments:['payment','billing','checkout','invoice','stripe','charge'],interface:['ui','frontend','screen','layout','design','accessibility'],storage:['database','schema','sql','storage','persistence','migration'],performance:['performance','latency','speed','optimization','cache','caching'],documentation:['docs','documentation','document','readme','guide'],outreach:['email','reply','contact','outreach','send','proposal']};
 const canon = x => String(x || '').trim().toLowerCase().replace(/^https?:\/\/(www\.)?/, '').replace(/\/$/, '').replace(/\.git$/, '');
 const json = (value,status=200) => Response.json({...value,note:NOTE,version:VERSION},{status});
 const sha = async value => Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(value))))).map(b=>b.toString(16).padStart(2,'0')).join('');
 function work(r) {
   const entity=canon(r.entity); if(!entity) throw Error('canonical entity required');
-  const text=String(r.description || '').toLowerCase(), found=new Set(r.facets || []);
-  for(const [f,words] of Object.entries(facets)) if(words.some(w=>new RegExp('\\b'+w+'\\b').test(text))) found.add(f);
-  return {entity,description:String(r.description || ''),kind:r.kind || 'engineering',resources:[...new Set((r.resources || []).map(canon))].sort(),facets:[...found].sort()};
+  const text=String(r.description || '').toLowerCase().replace(/[_-]/g,' '), found=new Set(r.facets || []);
+  for(const [f,words] of Object.entries(facets)) if(words.some(w=>new RegExp('\\b'+w+'(?:s|ed|ing)?\\b').test(text))) found.add(f);
+  const kind=r.kind || (found.has('documentation')?'documentation':found.has('interface')?'interface':'engineering');
+  return {entity,description:String(r.description || ''),kind,resources:[...new Set((r.resources || []).map(canon))].sort(),facets:[...found].sort()};
 }
 function conflict(a,b) {
   if(a.entity!==b.entity || a.kind==='read' || b.kind==='read') return null;
   const paths=a.resources.some(x=>b.resources.some(y=>x===y || x.startsWith(y+'/') || y.startsWith(x+'/')));
+  if(a.kind!==b.kind && !paths) return null;
   const common=a.facets.filter(x=>b.facets.includes(x));
   if(paths || common.length) return {reason:paths?'shared resource':'shared contribution facet',facets:common};
   if(a.resources.length && b.resources.length || a.facets.length && b.facets.length) return null;
@@ -22,23 +24,30 @@ function conflict(a,b) {
 export class Coordination extends DurableObject {
   constructor(ctx,env) {
     super(ctx,env); this.ctx=ctx;this.env=env;this.sql=ctx.storage.sql;
-    this.sql.exec(`CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,owner TEXT,scope TEXT,until REAL,state TEXT); CREATE TABLE IF NOT EXISTS sends(id TEXT PRIMARY KEY,fence TEXT UNIQUE,binding TEXT,state TEXT,receipt TEXT,updated REAL); CREATE TABLE IF NOT EXISTS events(n INTEGER PRIMARY KEY,at REAL,type TEXT,object TEXT,data TEXT); CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,data TEXT); CREATE TABLE IF NOT EXISTS observations(id TEXT PRIMARY KEY,source TEXT,data TEXT);`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS leases(id TEXT PRIMARY KEY,owner TEXT,scope TEXT,until REAL,state TEXT); CREATE TABLE IF NOT EXISTS sends(id TEXT PRIMARY KEY,fence TEXT UNIQUE,binding TEXT,state TEXT,receipt TEXT,updated REAL); CREATE TABLE IF NOT EXISTS send_fences(fence TEXT PRIMARY KEY,operation_id TEXT); CREATE TABLE IF NOT EXISTS events(n INTEGER PRIMARY KEY,at REAL,type TEXT,object TEXT,data TEXT); CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,data TEXT); CREATE TABLE IF NOT EXISTS observations(id TEXT PRIMARY KEY,source TEXT,data TEXT);`);
+    this.sql.exec('CREATE INDEX IF NOT EXISTS lease_activity ON leases(state,until); CREATE INDEX IF NOT EXISTS send_reconciliation ON sends(state,updated);');
   }
   rows(sql,...args){return [...this.sql.exec(sql,...args)];}
   event(type,id,data){this.sql.exec('INSERT INTO events(at,type,object,data) VALUES(?,?,?,?)',Date.now(),type,id,JSON.stringify(data));}
   take(r) {
     const s=work(r),now=Date.now(),ttl=Math.max(30,Math.min(1800,Number(r.ttl_seconds || 300)))*1000;
+    const aliases=this.state('aliases');s.entity=aliases[s.entity] || s.entity;
+    const enrichment=this.state('facet_terms'),lower=s.description.toLowerCase();
+    for(const[facet,terms]of Object.entries(enrichment))if(Array.isArray(terms) && terms.some(term=>lower.includes(String(term).toLowerCase())))s.facets.push(facet);
+    s.facets=[...new Set(s.facets)].sort();
     if(!r.operation_id || !r.owner) throw Error('operation_id and owner required');
     return this.ctx.storage.transactionSync(()=>{
       const old=this.rows('SELECT * FROM leases WHERE id=?',r.operation_id)[0];
       if(old && (old.owner!==r.owner || old.scope!==JSON.stringify(s))) throw Error('operation ID bound to different work');
       const conflicts=[];
       for(const l of this.rows("SELECT * FROM leases WHERE state='ACTIVE' AND until>? AND id!=?",now,r.operation_id)){
-        const c=conflict(s,JSON.parse(l.scope));if(c) conflicts.push({operation_id:l.id,owner:l.owner,until:l.until,...c});
+        const other=JSON.parse(l.scope);other.entity=aliases[other.entity] || other.entity;
+        const c=conflict(s,other);if(c) conflicts.push({operation_id:l.id,owner:l.owner,until:l.until,...c});
       }
-      if(conflicts.length) return {decision:'CHOOSE_DIFFERENT_ANGLE',conflicts,send_authorized:false,message:'Please choose a different angle of contribution or engineering for this claim, or choose another.',alternatives:Object.keys(facets).filter(f=>f!=='outreach' && !conflicts.some(c=>c.facets.includes(f)))};
+      const definite=conflicts.filter(c=>!c.ambiguous);
+      if(definite.length) return {decision:'CHOOSE_DIFFERENT_ANGLE',conflicts:definite,send_authorized:false,message:'Please choose a different angle of contribution or engineering for this claim, or choose another.',alternatives:Object.keys(facets).filter(f=>f!=='outreach' && !definite.some(c=>c.facets.includes(f)))};
       this.sql.exec('INSERT INTO leases VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET until=excluded.until,state=excluded.state',r.operation_id,r.owner,JSON.stringify(s),now+ttl,'ACTIVE');
-      this.event('take',r.operation_id,s);return {decision:'TAKEN',operation_id:r.operation_id,until:now+ttl,send_authorized:false};
+      this.event('take',r.operation_id,s);return {decision:conflicts.length?'TAKEN_WITH_SCOPE_ADVICE':'TAKEN',operation_id:r.operation_id,until:now+ttl,send_authorized:false,...(conflicts.length?{scope_advice:conflicts,message:'Continue a concrete independent angle; broad prior wording does not reserve the whole project.',alternatives:Object.keys(facets).filter(f=>f!=='outreach')}: {})};
     });
   }
   progress(r) {
@@ -53,10 +62,20 @@ export class Coordination extends DurableObject {
     for(const k of ['operation_id','provider','conversation_id','action','payload_hash','source_version','actor']) if(!r[k]) throw Error('missing outbound binding: '+k);
     const binding=JSON.stringify(Object.fromEntries(['provider','conversation_id','action','payload_hash','source_version','actor'].map(k=>[k,r[k]])));
     const fence=await sha([canon(r.provider),String(r.conversation_id),String(r.action)]);
+    const allFences=[...new Set([fence,...await Promise.all((r.conversation_ids || []).map(id=>sha([canon(r.provider),String(id),String(r.action)])))])];
     return this.ctx.storage.transactionSync(()=>{
-      const prior=this.rows('SELECT * FROM sends WHERE fence=? OR id=?',fence,r.operation_id)[0];
+      // A stale pre-dispatch reservation has no possible provider effect. CAS
+      // cancels its original dispatch right before allowing a new operation.
+      for(const expired of this.rows("SELECT * FROM sends WHERE state='RESERVED' AND updated<?",Date.now()-120000)){
+        this.sql.exec("UPDATE sends SET state='CANCELLED_BEFORE_DISPATCH',fence=? WHERE id=? AND state='RESERVED'",expired.fence+':cancelled:'+expired.id,expired.id);
+        this.sql.exec('DELETE FROM send_fences WHERE operation_id=?',expired.id);
+        this.event('CANCELLED_BEFORE_DISPATCH',expired.id,{});
+      }
+      let prior=this.rows('SELECT * FROM sends WHERE fence=? OR id=?',fence,r.operation_id)[0];
+      for(const key of allFences){if(prior)break;const shared=this.rows('SELECT operation_id FROM send_fences WHERE fence=?',key)[0];if(shared)prior=this.rows('SELECT * FROM sends WHERE id=?',shared.operation_id)[0];}
       if(prior) return {decision:prior.id===r.operation_id && prior.binding===binding?'ALREADY_RESERVED':'DO_NOT_SEND',operation_id:prior.id,state:prior.state,send_authorized:false,message:'Existing outbound effect is being reconciled; continue other work.'};
       this.sql.exec('INSERT INTO sends VALUES(?,?,?,?,?,?)',r.operation_id,fence,binding,'RESERVED',null,Date.now());this.event('reserved',r.operation_id,JSON.parse(binding));
+      for(const key of allFences)this.sql.exec('INSERT INTO send_fences VALUES(?,?)',key,r.operation_id);
       return {decision:'RESERVED',operation_id:r.operation_id,send_authorized:false};
     });
   }
@@ -69,7 +88,7 @@ export class Coordination extends DurableObject {
       const row=this.rows('SELECT * FROM sends WHERE id=?',r.operation_id)[0];
       if(!row || row.state!==r.before) return {decision:'DO_NOT_SEND',state:row?.state || 'UNKNOWN_OPERATION'};
       const binding=JSON.parse(row.binding);
-      if(r.payload_hash!==binding.payload_hash || r.source_version!==binding.source_version || r.actor!==binding.actor) throw Error('payload/source/actor fence changed');
+      if(['provider','conversation_id','action','payload_hash','source_version','actor'].some(k=>r[k]!==binding[k])) throw Error('conversation/action/payload/source/actor fence changed');
       if(r.after==='SENT' && r.receipt.actor!==binding.actor) throw Error('readback actor mismatch');
       this.sql.exec('UPDATE sends SET state=?,receipt=?,updated=? WHERE id=?',r.after,JSON.stringify(r.receipt || null),Date.now(),r.operation_id);this.event(r.after,r.operation_id,r.receipt || {});
       return {decision:r.after,dispatch_winner:r.after==='DISPATCHED',operation_id:r.operation_id};
@@ -85,10 +104,15 @@ export class Coordination extends DurableObject {
       else if(path==='/progress') result=this.progress(r);
       else if(path==='/reserve') result=await this.reserve(r);
       else if(path==='/transition') result=this.transition(r);
-      else if(path==='/collect') result=await this.collect();
+      else if(path==='/collect') {result=await this.collect();await this.reconcile();}
       else if(path==='/observe'){
         if(!r.id || !r.source) throw Error('observation ID/source required');
         this.sql.exec('INSERT INTO observations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',r.id,r.source,JSON.stringify(r));result={decision:'OBSERVED'};
+      } else if(path==='/alias'){
+        const aliases=this.state('aliases'),entity=canon(r.entity);if(!entity || !Array.isArray(r.aliases))throw Error('canonical entity and aliases required');
+        for(const name of r.aliases)aliases[canon(name)]=entity;this.save('aliases',aliases);
+        if(r.facet_terms){const enrichment=this.state('facet_terms');for(const[facet,terms]of Object.entries(r.facet_terms))if(Array.isArray(terms))enrichment[facet]=[...new Set([...(enrichment[facet] || []),...terms.map(String)])];this.save('facet_terms',enrichment);}
+        this.event('aliases',entity,r.aliases);result={decision:'ALIASES_UPDATED',entity,aliases:r.aliases};
       } else return json({error:'unknown endpoint'},404);
       return json(result);
     }catch(e){return json({error:e.message,decision:'REPAIR_REQUEST',alternatives:['choose another independent contribution','continue read-only source research']},400);}
@@ -116,16 +140,25 @@ export class Coordination extends DurableObject {
   }
   async collect(){
     if(!this.env.SLACK_TOKEN){this.save('slack:channels',{error:'shared_slack_binding_unconfigured',complete:false});return {decision:'COLLECTOR_NOT_CONFIGURED'};}
+    await this.ensureSocket();
     let catalog=this.state('slack:channels'),calls=0;
     const list=await this.slack('conversations.list',{limit:100,cursor:catalog.cursor || '',exclude_archived:true},'slack:channels');calls++;
     if(list){catalog={...catalog,channels:[...new Set([...(catalog.channels || []),...(list.channels || []).map(c=>c.id)])].sort(),cursor:list.response_metadata?.next_cursor || '',complete:!list.response_metadata?.next_cursor,error:null};this.save('slack:channels',catalog);}
     const channels=catalog.channels || [];if(!channels.length)return {requests:calls,channels:0};
     const index=catalog.index || 0,channel=channels[index%channels.length],id='slack:'+channel;
     let state=this.state(id),oldest=state.oldest || String(Date.now()/1000-86400);
+    state.bootstrap_latest ||= oldest;
     const history=await this.slack('conversations.history',{channel,limit:100,oldest,cursor:state.cursor || '',inclusive:false},id);calls++;
     if(history){let watermark=Number(state.watermark || oldest),threads=state.threads || {};
       for(const m of history.messages || []){this.observe(channel,m);watermark=Math.max(watermark,Number(m.ts));if(m.reply_count)threads[m.ts] ||= {cursor:'',oldest:'0'};}
       const cursor=history.response_metadata?.next_cursor || '';state={...state,cursor,oldest:cursor?oldest:String(watermark),watermark,threads,error:null,complete:!cursor};this.save(id,state);
+    }
+    // One retained historical page per channel visit discovers older thread
+    // roots once. Completed bootstraps are never restarted or fully rescanned.
+    if(!state.bootstrap_complete && calls<6){
+      const page=await this.slack('conversations.history',{channel,limit:100,oldest:'0',latest:state.bootstrap_latest,cursor:state.bootstrap_cursor || '',inclusive:false},id+':bootstrap');calls++;
+      if(page){state.threads ||= {};for(const m of page.messages || []){this.observe(channel,m);if(m.reply_count)state.threads[m.ts] ||= {cursor:'',oldest:'0'};}
+        state.bootstrap_cursor=page.response_metadata?.next_cursor || '';state.bootstrap_complete=!state.bootstrap_cursor;state.bootstrap_pages=(state.bootstrap_pages || 0)+1;this.save(id,state);}
     }
     const threads=Object.entries(state.threads || {}),start=state.thread_index || 0;let visited=0;
     for(let n=0;n<threads.length && calls<6;n++){
@@ -134,6 +167,39 @@ export class Coordination extends DurableObject {
     }
     if(threads.length){state.thread_index=(start+visited)%threads.length;this.save(id,state);}
     catalog.index=index+1;this.save('slack:channels',catalog);return {decision:'COLLECTED',requests:calls,channels:channels.length,visited:channel};
+  }
+  async ensureSocket(){
+    // Independent read-only source receiver. It can ACK Slack envelopes only;
+    // it contains no chat.postMessage, command transport or publisher replay.
+    if(this.socket?.readyState===1 || this.connecting || !this.env.SLACK_APP_TOKEN)return;
+    const prior=this.state('slack:events');if(prior.retry_at>Date.now())return;
+    this.connecting=true;
+    try{
+      const response=await fetch('https://slack.com/api/apps.connections.open',{method:'POST',headers:{Authorization:'Bearer '+this.env.SLACK_APP_TOKEN,'Content-Type':'application/x-www-form-urlencoded'},body:'',signal:AbortSignal.timeout(15000)});
+      const result=await response.json();if(!result.ok || !result.url){this.save('slack:events',{phase:'unavailable',error:result.error || 'socket_url_missing',retry_at:Date.now()+60000});return;}
+      const connection=await fetch(result.url.replace(/^wss:/,'https:'),{headers:{Upgrade:'websocket'}});
+      if(!connection.webSocket)throw Error('socket_upgrade_unavailable');
+      const socket=this.socket=connection.webSocket;socket.accept();
+      this.save('slack:events',{phase:'connected',connected_at:Date.now(),received:prior.received || 0,read_only:true});
+      socket.addEventListener('message',event=>{
+        try{
+          const envelope=JSON.parse(event.data);
+          if(envelope.envelope_id)socket.send(JSON.stringify({envelope_id:envelope.envelope_id}));
+          const payload=envelope.payload?.event;
+          const state=this.state('slack:events');this.save('slack:events',{...state,last_envelope_at:Date.now(),received:(state.received || 0)+1,last_event_type:payload?.type || envelope.type,last_envelope_type:envelope.type,...(envelope.type==='disconnect'?{disconnect_reason:envelope.reason || 'provider_disconnect'}:{})});
+          if(envelope.type==='disconnect'){this.save('slack:events',{...this.state('slack:events'),retry_at:Date.now()+(envelope.reason==='too_many_websockets'?300000:60000)});socket.close(1000,'Read-only receiver reconnect');return;}
+          if(payload?.type==='message' && payload.channel){
+            const message=payload.message || payload;if(message.ts)this.observe(payload.channel,message);
+            const key='slack:'+payload.channel,channel=this.state(key),root=message.thread_ts;
+            if(root){channel.threads ||= {};channel.threads[root] ||= {cursor:'',oldest:'0'};this.save(key,channel);}
+          }
+          if(payload?.type==='channel_created' && payload.channel?.id){const catalog=this.state('slack:channels');catalog.channels=[...new Set([...(catalog.channels || []),payload.channel.id])];this.save('slack:channels',catalog);}
+        }catch{this.save('slack:events',{...this.state('slack:events'),parse_error_at:Date.now()});}
+      });
+      socket.addEventListener('close',()=>{this.socket=null;this.save('slack:events',{...this.state('slack:events'),phase:'disconnected',disconnected_at:Date.now()});});
+      socket.addEventListener('error',()=>{this.socket=null;this.save('slack:events',{...this.state('slack:events'),phase:'unavailable',retry_at:Date.now()+60000});});
+    }catch{this.save('slack:events',{phase:'unavailable',error:'socket_connection_unavailable',retry_at:Date.now()+60000});}
+    finally{this.connecting=false;}
   }
   async alarm(){
     await this.collect();await this.reconcile();await this.ctx.storage.setAlarm(Date.now()+60000);
@@ -146,6 +212,13 @@ export class Coordination extends DurableObject {
         const[channel,root]=b.conversation_id.split(':'),m=await this.slack('conversations.replies',{channel,ts:root,oldest:receipt.provider_id,latest:receipt.provider_id,inclusive:true,limit:2},'reconcile:'+row.id);
         const found=m?.messages?.find(x=>x.ts===receipt.provider_id && x.user===b.actor);
         if(found && await sha(found.text)===b.payload_hash)this.transition({operation_id:row.id,before:row.state,after:'SENT',...b,receipt:{verified:true,actor:b.actor,provider_id:receipt.provider_id}});
+      }
+      if(b.provider==='github' && receipt?.provider_id && this.env.GITHUB_TOKEN){
+        const repo=b.conversation_id.split(':issue:')[0];
+        try{
+          const response=await fetch('https://api.github.com/repos/'+repo+'/issues/comments/'+receipt.provider_id,{headers:{Authorization:'Bearer '+this.env.GITHUB_TOKEN,'User-Agent':'TokenJunkieLabs-Collision-Coordinator'},signal:AbortSignal.timeout(10000)});
+          if(response.ok){const m=await response.json();if(m.user?.login===b.actor && await sha(m.body)===b.payload_hash)this.transition({operation_id:row.id,before:row.state,after:'SENT',...b,receipt:{verified:true,actor:b.actor,provider_id:String(m.id)}});}
+        }catch{}
       }
       this.sql.exec('UPDATE sends SET updated=? WHERE id=?',Date.now(),row.id);
     }
@@ -165,6 +238,25 @@ export default {
     if(new URL(request.url).pathname==='/health')return json({ok:true,storage:'cloud-sql-durable-object',pc_required:false});
     try{if(!await authenticated(request))return json({error:'use existing shared github credential; every peer may retrieve it directly'},401);
       const stub=env.COORDINATION.get(env.COORDINATION.idFromName('shared'));
+      if(new URL(request.url).pathname==='/mcp'){
+        const rpc=await request.json(),id=rpc.id;
+        const reply=result=>json({jsonrpc:'2.0',id,result});
+        if(rpc.method==='initialize')return reply({protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'TokenJunkieLabs-Collision-Coordinator',version:VERSION},instructions:NOTE});
+        if(rpc.method==='notifications/initialized')return new Response(null,{status:202,headers:{'X-Coordination-Repair-Note':NOTE}});
+        const schemas=[
+          {name:'collision_take',description:'Register a scoped expiring work take; fast alternatives keep independent work moving. '+NOTE,inputSchema:{type:'object',required:['operation_id','owner','entity'],properties:{operation_id:{type:'string'},owner:{type:'string'},entity:{type:'string'},description:{type:'string'},kind:{type:'string'},resources:{type:'array',items:{type:'string'}},facets:{type:'array',items:{type:'string'}},ttl_seconds:{type:'integer'}}}},
+          {name:'collision_progress',description:'Heartbeat, complete or release planning scope; never cancel provider effects. '+NOTE,inputSchema:{type:'object',required:['operation_id','owner'],properties:{operation_id:{type:'string'},owner:{type:'string'},state:{type:'string'},progress:{type:'string'},ttl_seconds:{type:'integer'}}}},
+          {name:'collision_snapshot',description:'Read shared scopes, durable effect states and source coverage. '+NOTE,inputSchema:{type:'object',properties:{}}}
+        ];
+        if(rpc.method==='tools/list')return reply({tools:schemas});
+        if(rpc.method==='tools/call'){
+          const routes={collision_take:'/take',collision_progress:'/progress',collision_snapshot:'/snapshot'},route=routes[rpc.params?.name];
+          if(!route)return reply({isError:true,content:[{type:'text',text:'Unknown coordination tool. '+NOTE}]});
+          const response=await stub.fetch('https://internal'+route,route==='/snapshot'?{}:{method:'POST',body:JSON.stringify(rpc.params.arguments || {})});
+          const value=await response.json();return reply({isError:response.status>=400,structuredContent:value,content:[{type:'text',text:JSON.stringify(value)}]});
+        }
+        return json({jsonrpc:'2.0',id,error:{code:-32601,message:'Unsupported method. '+NOTE}},400);
+      }
       return await stub.fetch(request);
     }catch(e){return json({error:'service unavailable; continue independent work and repair road'},503);}
   },

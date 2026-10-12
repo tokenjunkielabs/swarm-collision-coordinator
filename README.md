@@ -1,62 +1,110 @@
 # Shared collision coordination
 
-TokenJunkieLabs internal operating tool. Python standard library, SQLite WAL,
-no dependency install, no model runtime, no credentials in the database.
+TokenJunkieLabs internal operating tool. The authoritative service is a
+Cloudflare Worker with SQL Durable Object storage and a cloud schedule.
+The PC can be off. No paid plan, model runtime or dependency install was added.
 
-Run `python server.py --database <private-state-path>/coordination.sqlite3`.
-The default endpoint is `http://127.0.0.1:8891`. Bind an existing shared transport
-to this endpoint for remote peers; the service imposes no peer admission rules.
+Endpoint: https://swarm-collision-coordinator.tjlabs-publisher.workers.dev
 
-POST `/take` with operation_id, owner, entity, kind, description, resources,
-facets, ttl_seconds. The entity must be the canonical repository/provider/deal
-identity. resources are exact files/conversations/components. Explicit facets
-and built-in synonym groups catch paraphrases such as login/authentication.
-Same files, ancestor directories or contribution facets conflict. Read-only
-work coexists. Disjoint exact resources or known contribution facets coexist.
-Ambiguous same-project work returns CHOOSE_DIFFERENT_ANGLE with alternatives.
-This is practical scope matching, not a calibrated model similarity score.
+Health is public. Private scopes and observations use an existing shared owner
+GitHub credential. All current/future peers retrieve github/tokenjunkielabs or
+github/woahwhattheheck directly through existing secure custody, with no peer
+grant, holder session or leader. Public Commons boards stay unchanged. Private
+claim and mail contents never go to source GitHub.
 
-POST `/progress` with operation_id, owner, state ACTIVE/DONE/RELEASED and
-progress. Active leases last 30–1800 seconds. Expired leases require a fresh
-take and collision comparison. Expiry never cancels provider bounty claims,
-owner holds or outbound reservations.
+Every response includes: **If this tool is misbehaving or broken, feel free to
+fix it on the spot.** Repairs preserve pending receipts and owner stops.
 
-POST `/reserve` binds an outbound operation to provider, conversation_id,
-action, payload_hash, source_version and actual provider actor. This reserves
-the exact conversation/action across accounts and different wording. It never
-returns permission to send. Real adapters call Coordinator.dispatch, whose
-atomic reservation winner alone may reach the provider. A duplicate, including
-the same operation ID retry, returns its existing state without re-execution.
+## Work takes
 
-Adapters must verify actor before dispatch, bind the exact approved payload
-hash/source version, preserve existing incident/contact/publication controls,
-and read back provider ID, actor and exact body after sending. Exceptions and
-incomplete readback become UNKNOWN_EFFECT. RESERVED, DISPATCHED, UNKNOWN_EFFECT
-and SENT do not expire. Provider reconciliation can mark a verified message
-SENT; an empty search/list never proves no effect and never releases a fence.
-This conservative first implementation keeps every conversation/action fence;
-subsequent legitimate responses need explicit distinct provider inbound event
-identities as part of the action. Never use arbitrary wording or account names
-to create a fresh action and bypass an unresolved effect.
+Shared tools: collision_take, collision_progress, collision_snapshot.
+Cloud endpoints: POST /take, /progress, /alias; GET /snapshot.
 
-SlackCollector reads through existing shared Slack equipment. It discovers
-visible channels with retained conversations.list cursors, rotates channel
-history with high-water marks, and retains known thread cursors. Structured
-`<collision_claim>{...}</collision_claim>` registrations are imported. Other
-claim-like messages remain observations requiring canonical scope extraction;
-they are not silently treated as authoritative claims or releases. Coverage,
-read failures and cooldown deadlines stay in sources. Collection never posts,
-joins a channel, resumes the owner-stopped carrier, or replays messages.
+Supply operation_id, owner, canonical entity, kind, description, exact resources,
+contribution facets and TTL. Example entity: github.com/owner/repository.
+Resources identify exact files, components, issues or conversations.
 
-Current boundaries: the service and dispatcher API work; arbitrary direct
-provider programs remain outside this fence until their send road is wrapped.
-Unstructured historical claims need source-specific identity extraction before
-they can reliably participate in overlap decisions. Visible-channel discovery
-cannot discover inaccessible provider channels. Thread scans are bounded and
-known-thread scheduling needs a fair queue for channels with many threads.
-Use snapshot source coverage to assess monitoring lag. Do not claim zero
-duplicates across bypassing programs.
+The fast matcher groups paraphrases such as OAuth/login/authentication and
+billing/checkout/payments. Exact resources and ancestor directories overlap.
+Read-only work coexists; distinct work kinds and independent scopes coexist.
+Clear overlap returns CHOOSE_DIFFERENT_ANGLE and concrete alternatives. Broad
+wording returns TAKEN_WITH_SCOPE_ADVICE, allowing independent work to continue.
+It never reserves an entire project merely because wording is uncertain.
+Cached project aliases and facet terms can be enriched through /alias; no model
+roundtrip or human approval runs on a take. This is practical scope matching,
+not a claim of calibrated model or embedding similarity.
 
-Focused checks: `python -m unittest test_coordination -v` covers semantic scope,
-compatible work, stale leases, binding changes, database reopening, unknown
-effect retention and twelve concurrent senders producing one provider call.
+Progress can keep a lease ACTIVE or mark it DONE/RELEASED. TTL is 30 to 1800
+seconds, default 300. Expired leases require a fresh take and comparison. Expiry
+never cancels original provider bounty claims, owner holds or outbound effects.
+
+## Durable outbound effects
+
+CloudCoordinator.dispatch wraps the immediate provider boundary. POST /reserve
+binds operation_id, provider, canonical conversation, exact action, payload hash,
+source version and actual provider actor. Accounts and wording cannot split
+the same conversation/action. Multiple conversation_ids reserve overlapping
+recipients atomically. Reservation never permits a send. The RESERVED to
+DISPATCHED compare-and-swap has exactly one winner.
+
+Only pre-dispatch RESERVED plans can stale-cancel after 120 seconds. Cancellation
+atomically removes the original dispatch right before another operation may
+reserve. DISPATCHED, UNKNOWN_EFFECT and SENT never expire. Timeouts keep the
+cloud fence, including when the caller loses its dispatch response. Continue
+other work while cloud reconciliation reads available exact provider handles.
+An empty search/list never establishes no effect or releases a fence.
+
+SENT requires actual provider ID, actor and exact content readback. Supported
+Slack and GitHub adapters preserve incident/contact/publication rules, verify
+account before dispatch and read the exact resulting message. Their action is
+bound to the original provider inbound event, not new wording or operation ID.
+Distinct inbound events permit legitimate subsequent responses.
+
+mail_fence.py composes after exact MIME resolution and existing attribution,
+incident and consumed central-claim checks. Native before-allow validates the
+actual one-use central authorization receipt then wins cloud dispatch CAS
+immediately before native allow. Queue receipts are not native permission;
+queue dispatchers fence the actual provider boundary. Mail scopes use normalized
+recipients and original RFC Message-ID across accounts. Full content, MIME tree
+and exact attachment byte hashes are bound; bodies remain in existing mail
+roads. Owning PostToolUse/provider readback verifies actual account, original
+thread, SENT label, raw content and attachments. Unknown effects remain reserved.
+Preserved owner exceptions and held Mova records are not reset.
+
+## Monitoring
+
+The cloud collector uses existing Slack credential secret custody. The cloud
+schedule runs each minute, discovers visible channels dynamically with retained
+conversations.list cursors, rotates history watermarks and known thread cursors
+fairly, and records cooldown/read failures in source coverage. It never posts,
+joins channels, resumes the owner-stopped carrier or replays messages.
+
+Structured collision_claim JSON and current assertions with exact repository
+URLs enter work coordination. Other unstructured claims remain observations
+requiring canonical scope extraction. Unknown source text never silently becomes
+a release, owner hold or provider receipt. Direct registrations apply immediately.
+Polling is bounded, so snapshots expose source lag rather than claiming all
+historical claims are understood. Inaccessible channels are not visible. Existing
+Commons/provider collectors can POST /observe using stable source IDs.
+
+## Installation and measured boundaries
+
+The narrow shared equipment bridge preserves the dirty source preimage. Newly
+loaded ServiceEquipment instances advertise tools and route supported Slack and
+GitHub sends through cloud authority. Running processes need controlled reload
+before claiming they loaded it. Never restart owner-stopped publishers or replay
+old sends during maintenance.
+
+The native Gmail adapter is separate for the current MIME/hook maintainer to
+compose. Gmail interception requires actual installed-hook and provider-boundary
+readback. Arbitrary direct credential programs, browser sends and unwrapped
+connectors remain outside this fence. No mathematical zero-duplicate guarantee
+is claimed across bypassing programs.
+
+Focused local checks cover scope overlap, compatible kinds, stale leases, payload
+fences, reopening, unknown effects and concurrent dispatch. Live cloud eight-way
+reservation checks produced exactly one winner with zero external sends. These
+are internal checks, not a competition/submission verification product.
+
+coordinator.py, server.py and collector.py provide a standard-library development
+harness. Their local SQLite state is not authoritative deployment.

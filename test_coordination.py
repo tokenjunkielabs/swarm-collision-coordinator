@@ -47,6 +47,6 @@ class FocusedChecks(unittest.TestCase):
         self.assertEqual(reopened.reserve(self.send('s2', payload_hash=digest('reworded')))['decision'], 'DO_NOT_SEND')
     def test_ambiguous_project_does_not_silently_clear(self):
         self.db.take(self.work('a', 'work on project'))
-        self.assertEqual(self.db.take(self.work('b', 'implement changes'))['decision'], 'CHOOSE_DIFFERENT_ANGLE')
+        self.assertEqual(self.db.take(self.work('b', 'implement changes'))['decision'], 'TAKEN_WITH_SCOPE_ADVICE')
 
 if __name__ == '__main__': unittest.main()
