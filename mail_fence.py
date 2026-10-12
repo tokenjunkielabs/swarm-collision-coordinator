@@ -19,7 +19,7 @@ _OWNER_REVIEW_OP_HASHES={
     'f550b5b6bbd9f37e88b5fd9b12989bd9165831120a977f5806d31b2266f0d711',
     '9bd4ca58428fa2a2d65f9fd38846182262f6c1349f8613e183e57bf9e6914286',
 }
-_LAB_ROUTE_HASH='3e586c5f3976df8395bfb616d0c653917d5701ea2acb8ca98c4a2402e3a55fea'
+_LAB_ROUTE_HASH='32f3d105520402d7269774e9371916f660fbff6a1c76fd8c9c48feca8514d0f7'
 
 def address(value):
     parsed=parseaddr(str(value))[1].strip().lower()
@@ -35,6 +35,13 @@ def binding(resolved):
     """
     for key in ('operation_id','attempt_id','account','sender','to','subject','mime_tree_digest','content_digest','link_id'):
         if key not in resolved or resolved[key] in (None,'',[]):raise ValueError('mail binding missing '+key)
+    selected=resolved.get('selected_account')
+    if selected is not None:
+        if not isinstance(selected,dict):raise ValueError('selected account binding invalid')
+        for key in ('link_id','profile_id'):
+            if key in selected and str(selected[key] or '')!=str(resolved.get(key) or ''):raise ValueError('selected account '+key+' mismatch')
+        for key in ('account','email'):
+            if key in selected and address(selected[key])!=address(resolved['account']):raise ValueError('selected account address mismatch')
     kind=resolved.get('kind','send')
     for key in ('to','cc','bcc'):
         if not isinstance(resolved.get(key,[]),list):raise ValueError('resolved recipient lists required')
