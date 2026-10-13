@@ -2,7 +2,7 @@
 export const REPAIR_NOTE='If this tool is misbehaving or broken, feel free to fix it on the spot.';
 const BASE='https://swarm-collision-coordinator.tjlabs-publisher.workers.dev';
 const ownerReviewHashes=new Set(['ae646d823871f31c6089671187ff9e31eb35cab27d309d946e667bbe88a44c0e','f394ac323133c106ba9bf9e20e0b341561afaa8bee8f954d20104ad2540b4ac8','2320cb840d27a3159fe488b8bc28a51a96d4bc600b26658f95ac1b953f6f14a8','f550b5b6bbd9f37e88b5fd9b12989bd9165831120a977f5806d31b2266f0d711','9bd4ca58428fa2a2d65f9fd38846182262f6c1349f8613e183e57bf9e6914286']);
-const labRouteHash='32f3d105520402d7269774e9371916f660fbff6a1c76fd8c9c48feca8514d0f7';
+const labRouteHash='7c63ad2c4d4edd1fee4c205f9a44ee0cb80f23b9a1705913dedb0e5a36096eb8';
 const canonical=value=>JSON.stringify(value,(_,v)=>v && typeof v==='object' && !Array.isArray(v)?Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v);
 const hashText=async text=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)))].map(x=>x.toString(16).padStart(2,'0')).join('');
 const hash=value=>hashText(canonical(value));

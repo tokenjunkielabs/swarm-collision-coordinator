@@ -19,7 +19,7 @@ _OWNER_REVIEW_OP_HASHES={
     'f550b5b6bbd9f37e88b5fd9b12989bd9165831120a977f5806d31b2266f0d711',
     '9bd4ca58428fa2a2d65f9fd38846182262f6c1349f8613e183e57bf9e6914286',
 }
-_LAB_ROUTE_HASH='32f3d105520402d7269774e9371916f660fbff6a1c76fd8c9c48feca8514d0f7'
+_LAB_ROUTE_HASH='7c63ad2c4d4edd1fee4c205f9a44ee0cb80f23b9a1705913dedb0e5a36096eb8'
 
 def address(value):
     parsed=parseaddr(str(value))[1].strip().lower()
